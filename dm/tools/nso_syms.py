@@ -5,7 +5,7 @@ dm/games/profile_guess.py imports it (dynsyms, host_hooks) to guess a provisiona
 import collections, glob, os, re, struct, sys
 
 def load(path):
-    import lz4.block   # Only NSO decoding needs LZ4; profile log parsing does not.
+    from nso_decompress import decompress_segment
     d = open(path, 'rb').read()
     flags = struct.unpack_from('<I', d, 0xc)[0]
     segs = [struct.unpack_from('<III', d, 0x10 + i * 0x10) for i in range(3)]
@@ -13,7 +13,8 @@ def load(path):
     img = bytearray(segs[2][1] + segs[2][2] + struct.unpack_from('<I', d, 0x3c)[0])
     for i, (fo, mo, sz) in enumerate(segs):
         raw = d[fo:fo + csz[i]]
-        if flags >> i & 1: raw = lz4.block.decompress(raw, uncompressed_size=sz)
+        if flags >> i & 1:
+            raw = decompress_segment(raw, sz, flags, i)
         img[mo:mo + sz] = raw
     return bytes(img)
 

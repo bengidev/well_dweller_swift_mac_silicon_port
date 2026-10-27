@@ -11,12 +11,14 @@ import struct, sys, collections
 def image(path):
     d = open(path, 'rb').read()
     if d[:4] != b'NSO0': return d, len(d)
-    import lz4.block
+    from nso_decompress import decompress_segment
     flags = struct.unpack_from('<I', d, 0xc)[0]; segs = [struct.unpack_from('<III', d, 0x10 + i * 0x10) for i in range(3)]; csz = struct.unpack_from('<III', d, 0x60)
     img = bytearray(segs[2][1] + segs[2][2])
     for i, (fo, mo, sz) in enumerate(segs):
         raw = d[fo:fo + csz[i]]
-        img[mo:mo + sz] = lz4.block.decompress(raw, uncompressed_size=sz) if flags >> i & 1 else raw
+        if flags >> i & 1:
+            raw = decompress_segment(raw, sz, flags, i)
+        img[mo:mo + sz] = raw
     return bytes(img), segs[0][2]
 
 def adrp(w, pc):

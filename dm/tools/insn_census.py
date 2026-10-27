@@ -6,7 +6,8 @@ Linear sweep over text, leaving out the data blocks patch_nso.py leaves alone (n
 Usage: insn_census.py <module.nso> [--sites <tsv out>]"""
 import collections, os, struct, sys
 import re
-import capstone, lz4.block
+import capstone
+from nso_decompress import decompress_segment
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nso_code
 
@@ -20,7 +21,9 @@ def image_of(path):   # (text segment offset, text size, the image of all three 
     img = bytearray(segs[2][1] + segs[2][2])
     for i, (fo, mo, sz) in enumerate(segs):
         raw = d[fo:fo + csz[i]]
-        img[mo:mo + sz] = lz4.block.decompress(raw, uncompressed_size=sz) if flags >> i & 1 else raw
+        if flags >> i & 1:
+            raw = decompress_segment(raw, sz, flags, i)
+        img[mo:mo + sz] = raw
     return segs[0][1], segs[0][2], img
 
 def main():

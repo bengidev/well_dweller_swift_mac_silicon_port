@@ -107,14 +107,16 @@ if __name__ == '__main__':
     from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
     p = sys.argv[1]; raw = open(p, 'rb').read()
     if raw[:4] == b'NSO0':
-        import lz4.block
+        from nso_decompress import decompress_segment
         flags = struct.unpack_from('<I', raw, 0xc)[0]
         segs = [struct.unpack_from('<III', raw, 0x10 + i * 0x10) for i in range(3)]
         csz = struct.unpack_from('<III', raw, 0x60)
         img = bytearray(segs[2][1] + segs[2][2])
         for i, (fo, mo, sz) in enumerate(segs):
             seg = raw[fo:fo + csz[i]]
-            img[mo:mo + sz] = lz4.block.decompress(seg, uncompressed_size=sz) if flags >> i & 1 else seg
+            if flags >> i & 1:
+                seg = decompress_segment(seg, sz, flags, i)
+            img[mo:mo + sz] = seg
         text_end = segs[0][2]
     else:
         img = raw; text_end = int(sys.argv[2], 0)

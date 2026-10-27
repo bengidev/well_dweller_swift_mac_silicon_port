@@ -33,13 +33,15 @@ MiB = 1 << 20
 
 def nso(path):
     """An NSO module: its three segments decompressed (the image without bss), build ID, segment sizes and bss size"""
-    import lz4.block
+    from nso_decompress import decompress_segment
     d = Path(path).read_bytes(); flags = struct.unpack_from('<I', d, 0xc)[0]
     segs = [struct.unpack_from('<III', d, 0x10 + i * 0x10) for i in range(3)]; csz = struct.unpack_from('<III', d, 0x60)
     img = bytearray(segs[2][1] + segs[2][2])
     for i, (fo, mo, sz) in enumerate(segs):
         raw = d[fo:fo + csz[i]]
-        img[mo:mo + sz] = lz4.block.decompress(raw, uncompressed_size=sz) if flags >> i & 1 else raw
+        if flags >> i & 1:
+            raw = decompress_segment(raw, sz, flags, i)
+        img[mo:mo + sz] = raw
     return bytes(img), d[0x40:0x50].hex(), [sz for _, _, sz in segs], struct.unpack_from('<I', d, 0x3c)[0]
 
 

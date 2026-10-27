@@ -5,7 +5,7 @@ Keeps the NSO memory layout (vaddr = offset in the loaded image): text R-X, roda
 plus PT_DYNAMIC (located through MOD0) so dynsym imports/exports and RELA relocations are recovered,
 and PT_GNU_EH_FRAME (eh_frame_hdr from MOD0) as a function-start hint. No section headers."""
 import struct, sys
-import lz4.block
+from nso_decompress import decompress_segment
 
 PAGE = 0x1000; HDR = 0x1000                     # file offset of image byte 0; keeps p_offset == p_vaddr (mod PAGE)
 
@@ -19,7 +19,7 @@ def load(path):
     img = bytearray(segs[2][1] + segs[2][2])
     for i, (fo, mo, sz) in enumerate(segs):
         raw = d[fo:fo + csz[i]]
-        if flags >> i & 1: raw = lz4.block.decompress(raw, uncompressed_size=sz)
+        if flags >> i & 1: raw = decompress_segment(raw, sz, flags, i)
         if len(raw) != sz: sys.exit('segment %d size mismatch' % i)
         img[mo:mo + sz] = raw
     return bytes(img), [(mo, sz) for _, mo, sz in segs], bss, d[0x40:0x60]
