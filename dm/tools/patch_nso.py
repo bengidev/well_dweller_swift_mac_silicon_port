@@ -115,6 +115,24 @@ def emit(w, kind=None):
     if kind: fix.append((len(patch), kind))
     patch.extend(struct.pack('<I', w & 0xFFFFFFFF))
 
+def b_reachable(frm, to):
+    off = to - frm
+    return -(1 << 27) <= off < (1 << 27) and off % 4 == 0
+
+EXIT_STUB_BYTES = 20 if BIG_TEXT else 16
+
+def emit_exit_branch(S, T, target):
+    """Fall-through or branch-out stub after a window copy (STRX; LDP; branch to target). BIG_TEXT modules may need ADRP+BR."""
+    stub = here()
+    emit(STRX(S, T)); emit(LDP(S, T, 31, -16))
+    pc = here()
+    if b_reachable(pc, target):
+        emit(B(pc, target))
+    else:
+        emit(ADRP(16, pc, target)); emit(ADDI(16, 16, target & 0xFFF)); emit(BR(16))
+    while here() - stub < EXIT_STUB_BYTES:
+        emit(NOP)
+
 def emit_key_addr(reg, kind):
     fix.append((len(patch), kind)); emit(ADRP(reg, here(), KEY_PAGE_OFF)); emit(LDRX(reg, reg, KEY_INDEX[kind]))
 
@@ -368,7 +386,7 @@ def site_window(seg):
     # Exit stubs: the first stub right after the window must be the fall-through one (after the last window instruction, hi); targets of branches leaving the window come after it.
     # Previously the fall-through stub came last: as soon as a window contains a conditional branch out (e.g. ldxr; cmp; b.ne out; stxr; cbnz), a successful stxr fell into the
     # first branch-out stub, i.e. took the "compare not equal" path (SMBW main 0x81c40: the enqueue retried forever, the tail index filled up without storing a single task, and the job system hung). D2R's windows had no branch out, so it never hit this.
-    exits = copy0 + 4 * n + 16
+    exits = copy0 + 4 * n + EXIT_STUB_BYTES
     ex_targets = []; words = []
     for k, x in enumerate(seg):
         w = struct.unpack('<I', x.bytes)[0]
@@ -377,7 +395,7 @@ def site_window(seg):
         if m in ('cbz', 'cbnz', 'tbz', 'tbnz') or m.startswith('b.'):
             tgt = x.operands[-1].imm
             if lo <= tgt < hi: newt = copy0 + (tgt - lo)
-            else: ex_targets.append(tgt); newt = exits + 16 * (len(ex_targets) - 1)
+            else: ex_targets.append(tgt); newt = exits + EXIT_STUB_BYTES * (len(ex_targets) - 1)
             pc = copy0 + 4 * k; off = (newt - pc) >> 2
             if m in ('tbz', 'tbnz'): w = (w & 0xFFF8001F) | ((off & 0x3FFF) << 5)
             else: w = (w & 0xFF00001F) | ((off & 0x7FFFF) << 5)
@@ -388,7 +406,7 @@ def site_window(seg):
         words.append(w)
     for w in words: emit(w)
     for t in [hi] + ex_targets:   # fall-through first
-        emit(STRX(S, T)); emit(LDP(S, T, 31, -16)); emit(B(here(), t)); emit(NOP)
+        emit_exit_branch(S, T, t)
     return start, lo, hi
 
 def retry_block(insl, k, wseg):
@@ -419,7 +437,7 @@ def site_retry_window(parts):
     pos, at = {}, here()
     for seg, _ in parts:
         for x in seg: pos[x.address] = at; at += 4
-        at += 16
+        at += EXIT_STUB_BYTES
     exits, ex_targets = at, []
     for seg, ft in parts:
         for x in seg:
@@ -429,7 +447,7 @@ def site_retry_window(parts):
             if m in ('cbz', 'cbnz', 'tbz', 'tbnz') or m.startswith('b.'):
                 tgt = x.operands[-1].imm
                 if tgt not in pos and tgt not in ex_targets: ex_targets.append(tgt)
-                newt = pos[tgt] if tgt in pos else exits + 16 * ex_targets.index(tgt)
+                newt = pos[tgt] if tgt in pos else exits + EXIT_STUB_BYTES * ex_targets.index(tgt)
                 off = (newt - pc) >> 2
                 if m in ('tbz', 'tbnz'): w = (w & 0xFFF8001F) | ((off & 0x3FFF) << 5)
                 else: w = (w & 0xFF00001F) | ((off & 0x7FFFF) << 5)
@@ -438,9 +456,9 @@ def site_retry_window(parts):
             else:
                 assert m not in ('adr', 'adrp', 'b', 'bl', 'br', 'blr', 'ret') and not (m == 'ldr' and '[' not in x.op_str), hex(x.address)
             emit(w)
-        emit(STRX(S, T)); emit(LDP(S, T, 31, -16)); emit(B(here(), ft)); emit(NOP)
+        emit_exit_branch(S, T, ft)
     for t in ex_targets:
-        emit(STRX(S, T)); emit(LDP(S, T, 31, -16)); emit(B(here(), t)); emit(NOP)
+        emit_exit_branch(S, T, t)
     return start
 
 # ---- Function boundaries (eh_frame_hdr) ----
