@@ -1,6 +1,7 @@
 // Guest thread environment: gate slot = host gate entry; x18 slot cleared; tpidr_el0 slot = ELF TLS block; tpidrro_el0 slot = Horizon ThreadLocalRegion (0x200).
-// The SDK's internal critical section takes the current thread object pointer from TLR[0x1f8]; here each thread gets a zero-initialized object allocated and written in.
+// The kernel owns two fields of the ThreadLocalRegion that the SDK reads: the current thread object at TLR[0x1f8] and, since SDK 22, the thread's ID at TLR[0x110] (nn::os 22's internal critical section stores it as the mutex owner and compares it in IsLockedByCurrentThread, where SDK 16 compared the object pointer). Here each thread gets a zero-initialized object allocated and written in.
 #include "dm.h"
+#include <stdatomic.h>
 #define TLS_SIZE 8192
 #define TLR_SIZE 0x200
 #define THREAD_OBJ_SIZE 0x400
@@ -9,6 +10,7 @@ static pthread_key_t g_keyown;   // raw pointers of the TLS block / thread-local
 static pthread_once_t g_keyown_once = PTHREAD_ONCE_INIT;
 static void own_free(void *p) { void **own = p; free(own[0]); free(own[1]); free(own); }
 static void own_key_init(void) { if (pthread_key_create(&g_keyown, own_free)) die("cannot create the free key for thread-local blocks"); }
+void *dm_tlr_self(void) { return pthread_getspecific(g_keytlr); }   // this thread's ThreadLocalRegion, for diagnosing what the SDK reads from it
 void guest_thread_init(void) {
     pthread_setspecific(g_keygate, (void *)dm_gate);
     pthread_setspecific(g_key18, 0);
@@ -21,6 +23,8 @@ void guest_thread_init(void) {
     own[0] = calloc(1, TLS_SIZE); own[1] = tlr;
     if (!own[0]) die("guest thread TLS block allocation failed");
     *(void **)(tlr + 0x1f8) = tlr + TLR_SIZE;               // current thread object
+    static _Atomic uint32_t g_next_tid = 1;                  // thread IDs are unique and never 0: 0 is the owner word of an unlocked mutex
+    *(uint32_t *)(tlr + 0x110) = atomic_fetch_add(&g_next_tid, 1);
     pthread_setspecific(g_keytls, own[0]); pthread_setspecific(g_keytlr, tlr);
     void **prev = pthread_getspecific(g_keyown); if (prev) own_free(prev);   // re-initialised on the same thread: free the previous set first (the new one is what the slots now point to)
     pthread_setspecific(g_keyown, own);

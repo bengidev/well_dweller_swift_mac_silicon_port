@@ -20,6 +20,9 @@
 #include "../../host/hle.h"
 #include "../nvn/nvn_mtl.h"
 #import <Metal/Metal.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <mach/mach.h>
 #include <mach-o/getsect.h>
@@ -137,6 +140,7 @@ static _Atomic uint64_t g_done;                  // highest serial whose command
 static id<MTLCommandBuffer> g_cb;
 static id<MTLRenderCommandEncoder> g_enc;
 static _Atomic uint64_t g_n_draw, g_n_pass, g_n_up, g_n_blit, g_n_pso, g_n_cb;
+static _Atomic uint64_t g_sk_prog, g_sk_pass, g_sk_attr, g_sk_pso;   // draws dropped in draw_setup, by reason
 
 // ---------- Shader table (<DM_MSL_DIR>/gl/gl_shaders.tsv) ----------
 enum { T_FLOAT, T_VEC2, T_VEC3, T_VEC4, T_INT, T_IVEC2, T_IVEC3, T_IVEC4, T_UINT, T_UVEC2, T_UVEC3, T_UVEC4, T_BOOL, T_MAT2, T_MAT3, T_MAT4,
@@ -895,6 +899,11 @@ static void bind_uniforms_textures(prog_t *p) {
         id<MTLTexture> tx = nil; id<MTLSamplerState> sm = g_samp0;
         if (t && (t->made || tex_make(t, 0)) && t->tex) { tx = t->tex; sm = tex_sampler(t); t->use = g_serial; }
         if (!tx) tx = u->type == T_SAMPCUBE ? g_cube0 : u->type == T_SAMP3D ? g_tex3d0 : u->type == T_SAMP2DARR ? g_arr0 : g_tex0;
+        if (tx == g_tex0 && t == NULL && getenv("DM_GL_DRAWLOG")) {   // a sampler with no texture: the layer draws the 1x1 black placeholder
+            static uint32_t seen_p[64]; static int seen_u[64], nseen;
+            int dup = 0; for (int k = 0; k < nseen; k++) if (seen_p[k] == p->serial && seen_u[k] == unit) dup = 1;
+            if (!dup && nseen < 64) { seen_p[nseen] = p->serial; seen_u[nseen++] = unit;
+                GLOG("program %u sampler %s (unit %d) has no texture: drawing the 1x1 black placeholder", p->serial, u->name, unit); } }
         for (int st = 0; st < 2; st++) {
             if (u->slot[st] < 0) continue;
             if (st) { [e setFragmentTexture:tx atIndex:u->slot[st]]; [e setFragmentSamplerState:sm atIndex:u->slot[st]]; }
@@ -903,36 +912,89 @@ static void bind_uniforms_textures(prog_t *p) {
     }
     E.prog = p->serial;
 }
+static int g_dl_mode, g_dl_n, g_dl_inst, g_dl_elems;   // the draw call being set up, for the DM_GL_DRAWLOG line
+static int64_t g_dl_first, g_dl_vend;   // the vertex range a draw touches: client-memory arrays are copied by it
 // Everything a draw needs; 0 = skip it
+static id<MTLTexture> fb_color(GLuint fb, int *level, int *slice);
 static int draw_setup(void) {
     prog_t *p = prog_of(S.prog);
-    if (!p || !p->linked) { RED1("draw with no usable program (%u)", S.prog); return 0; }
-    if (!pass_ensure()) return 0;
+    if (!p || !p->linked) { g_sk_prog++; RED1("draw with no usable program (%u)", S.prog); return 0; }
+    if (!pass_ensure()) { g_sk_pass++; return 0; }
     pkey_t k; memset(&k, 0, sizeof k);
     vao_t *v = cur_vao(); const shinfo *vs = p->si[0];
+    id<MTLBuffer> cbuf[16] = {nil}; size_t coff[16] = {0};
     for (int i = 0; i < vs->na; i++) {
         int s = vs->a[i].slot; vattr_t *a = &v->a[p->amap[s]];
         if (!a->on) continue;
-        buf_t *b = buf_of(a->buf);
-        if (!b || !b->mb) { RED1("vertex attribute %d reads client memory or a buffer with no data (not implemented)", p->amap[s]); return 0; }
         k.vf[s] = (uint32_t)vfmt_of(a);
         k.stride[s] = a->stride ? a->stride : a->size * vtype_bytes(a->type); k.div[s] = a->div;
         if (!k.vf[s] || (k.stride[s] & 3)) { RED1("vertex attribute %d: type %#x size %d stride %d not mapped", p->amap[s], a->type, a->size, a->stride); return 0; }
+        buf_t *b = buf_of(a->buf);
+        if (b && b->mb) continue;   // a vertex buffer: bound as it is
+        if (a->buf) { g_sk_attr++; RED1("vertex attribute %d reads a buffer with no data (%u)", p->amap[s], a->buf); return 0; }
+        // Client memory: GL lets the game keep the vertices in its own array, Metal needs a buffer, so copy the span this draw touches into a
+        // transient block (GameMaker's runner draws every sprite and the screen composite through such arrays)
+        {   int64_t lo = g_dl_first, hi = g_dl_vend; if (hi - lo < 1) hi = lo + 1;
+            size_t stride = k.stride[s], esz = (size_t)a->size * (size_t)vtype_bytes(a->type);
+            size_t len = (size_t)(hi - lo - 1) * stride + esz;
+            if (!esz || len > (128u << 20)) { g_sk_attr++; RED1("vertex attribute %d: client array span %zu bytes is out of range", p->amap[s], len); return 0; }
+            size_t off; id<MTLBuffer> mb = arena_alloc(len, &off);
+            memcpy((uint8_t *)mb.contents + off, (const uint8_t *)(uintptr_t)a->off + (size_t)lo * stride, len);
+            cbuf[s] = mb; coff[s] = off;   // bound below
+        }
     }
     k.cpf = P.cpf; k.dpf = P.dpf; k.spf = P.spf; k.mask = S.cmask;
     if (S.blend && P.cpf) { k.blend = 1; k.bsrc = bcode(S.bsrc); k.bdst = bcode(S.bdst); k.bsa = bcode(S.bsa); k.bda = bcode(S.bda); k.eqc = beq_of(S.eqc); k.eqa = beq_of(S.eqa); }
     id<MTLRenderPipelineState> pso = pso_get(p, &k);
-    if (!pso) return 0;
+    if (!pso) { g_sk_pso++; return 0; }
     id<MTLRenderCommandEncoder> e = g_enc;
     if ((__bridge void *)pso != E.pso) { E.pso = (__bridge void *)pso; [e setRenderPipelineState:pso]; }
     enc_state();
     for (int i = 0; i < vs->na; i++) {
         int s = vs->a[i].slot, gi = p->amap[s]; vattr_t *a = &v->a[gi];
-        if (a->on) { buf_t *b = buf_of(a->buf); b->use = g_serial; [e setVertexBuffer:b->mb offset:a->off atIndex:30 - s]; }
+        if (a->on && cbuf[s]) [e setVertexBuffer:cbuf[s] offset:coff[s] atIndex:30 - s];
+        else if (a->on) { buf_t *b = buf_of(a->buf); b->use = g_serial; [e setVertexBuffer:b->mb offset:a->off atIndex:30 - s]; }
         else [e setVertexBytes:S.va[gi] length:16 atIndex:30 - s];
     }
     bind_uniforms_textures(p);
     g_n_draw++;
+    // DM_GL_DRAWLOG=<n>[:<seconds>]: the first n draws after <seconds> of run time (default 0) with their target, viewport, scissor box and program
+    // (a port's first question is where its draws go: a picture that stays black while the game keeps drawing is usually a target or a viewport, not a shader)
+    { static long lim = -1, start_at; static double t0; static long n;
+      if (lim < 0) { const char *e = getenv("DM_GL_DRAWLOG"); lim = e ? atol(e) : 0; if (e && strchr(e, ':')) start_at = atol(strchr(e, ':') + 1); t0 = now_ns() / 1e9; }
+      if (n < lim && now_ns() / 1e9 - t0 >= (double)start_at) { int lv = 0, sl = 0; id<MTLTexture> t = fb_color(S.fb, &lv, &sl); n++;
+          float m[20][4] = {{0}}; const shinfo *vsi = p->si[0]; int have = p->ub[0] && vsi->ub_size >= 320;
+          if (have) memcpy(m, p->ub[0], sizeof m);
+          fb_t *fbt = fb_of(S.fb);
+          GLOG("draw %ld: framebuffer %u (colour tex %u) target %ux%u viewport %d,%d %dx%d scissor %d,%d %dx%d program %u blend %d mode %#x %s %d x%d",
+               (long)n, S.fb, fbt ? fbt->col.name : 0, t ? (unsigned)t.width : 0, t ? (unsigned)t.height : 0, S.vp[0], S.vp[1], S.vp[2], S.vp[3], S.sc[0], S.sc[1], S.sc[2], S.sc[3],
+               S.prog, S.blend, (unsigned)g_dl_mode, g_dl_elems ? "indexed" : "array", g_dl_n, g_dl_inst);
+          if (have) GLOG("   gm_Matrices[0] %.6f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
+                         m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0], m[2][1], m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3]);
+          if (have) GLOG("   gm_Matrices[4] (WORLD_VIEW_PROJECTION) %.6f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
+                         m[16][0], m[16][1], m[16][2], m[16][3], m[17][0], m[17][1], m[17][2], m[17][3], m[18][0], m[18][1], m[18][2], m[18][3], m[19][0], m[19][1], m[19][2], m[19][3]);
+          { static uint32_t dumped[32]; static int ndumped; int seen = 0; for (int k = 0; k < ndumped; k++) if (dumped[k] == p->serial) seen = 1;
+            if (!seen && ndumped < 32) { dumped[ndumped++] = p->serial;
+                GLOG("program %u blocks: vertex slot %d size %u, fragment slot %d size %u; %d uniforms:", p->serial, p->si[0]->ub_slot, p->si[0]->ub_size, p->si[1]->ub_slot, p->si[1]->ub_size, p->nu);
+                for (int k = 0; k < p->nu; k++) GLOG("   uniform %s type %u count %u unit %d (offset vertex %d fragment %d)", p->u[k].name, p->u[k].type, p->u[k].count, p->u[k].unit, p->u[k].off[0], p->u[k].off[1]); } }
+          // The textures the samplers point at: a full-screen composite of a 1280x720 surface must show that size in unit 0
+          { char line[512]; size_t o = 0;
+            for (int i = 0; i < 16; i++) { GLuint tn = S.units[i].t2d; tex_t *t = tex_of(tn); if (!t || !t->tex) continue;
+              o += snprintf(line + o, sizeof line - o, "%s%d: tex %u %ux%u fmt %lu", o ? ", " : "", i, tn, (unsigned)t->tex.width, (unsigned)t->tex.height, (unsigned long)t->tex.pixelFormat); }
+            GLOG("   samplers %s", line); }
+          // The first three vertices of every active attribute: where a black frame's quads actually are and which part of a texture they read
+          { vao_t *va = cur_vao();
+            for (int i = 0; i < vsi->na && i < 8; i++) { int s = vsi->a[i].slot, gi = p->amap[s]; vattr_t *a = &va->a[gi];
+              if (!a->on || a->size < 1 || a->size > 4) continue;
+              buf_t *b = buf_of(a->buf);
+              const uint8_t *base = b && b->mb ? (const uint8_t *)b->mb.contents + a->off : a->buf ? NULL : (const uint8_t *)(uintptr_t)a->off;
+              if (!base) { GLOG("   attribute %d: no data", gi); continue; }
+              size_t st = a->stride ? a->stride : a->size * vtype_bytes(a->type);
+              char v[3][64]; for (int k = 0; k < 3; k++) { const float *f = (const float *)(base + k * st); char *o = v[k]; o += snprintf(o, 64, "(");
+                for (int c = 0; c < a->size && c < 4; c++) o += snprintf(o, 64 - (size_t)(o - v[k]), "%s%.4f", c ? " " : "", f[c]);
+                snprintf(o, 64 - (size_t)(o - v[k]), ")"); }
+              GLOG("   attribute %d: size %d type %#x stride %zu %s, first 3 vertices %s %s %s", gi, a->size, a->type, st, a->buf ? "buffer" : "client memory", v[0], v[1], v[2]); } } } }
+
     return 1;
 }
 static MTLPrimitiveType prim_of(GLenum m, int *conv) {
@@ -958,6 +1020,7 @@ static uint32_t idx_convert(int conv, const uint32_t *in, uint32_t n, uint32_t b
 }
 static void draw_arrays(GLenum mode, GLint first, GLsizei count, GLsizei inst) {
     if (count <= 0 || inst <= 0) return;
+    g_dl_mode = mode; g_dl_n = count; g_dl_inst = inst; g_dl_elems = 0; g_dl_first = first; g_dl_vend = (int64_t)first + count;
     @autoreleasepool {
         int conv; MTLPrimitiveType pt = prim_of(mode, &conv);
         if (conv < 0 || !draw_setup()) return;
@@ -970,6 +1033,7 @@ static void draw_arrays(GLenum mode, GLint first, GLsizei count, GLsizei inst) {
 // base: added to every index (glDrawElementsBaseVertex: LÖVE draws its batched quads with one shared index buffer so)
 static void draw_elements(GLenum mode, GLsizei count, GLenum type, const void *indices, GLint base, GLsizei inst) {
     if (count <= 0 || inst <= 0) return;
+    g_dl_mode = mode; g_dl_n = count; g_dl_inst = inst; g_dl_elems = 1;
     @autoreleasepool {
         int conv; MTLPrimitiveType pt = prim_of(mode, &conv);
         if (conv < 0) return;
@@ -977,6 +1041,15 @@ static void draw_elements(GLenum mode, GLsizei count, GLenum type, const void *i
         uintptr_t io = (uintptr_t)indices; int isz = type == GL_UNSIGNED_INT ? 4 : type == GL_UNSIGNED_SHORT ? 2 : 1;
         const uint8_t *src = eb ? (eb->mb ? (const uint8_t *)eb->mb.contents + io : NULL) : (const uint8_t *)indices;
         if (!src || (eb && io + (size_t)count * isz > eb->size)) { RED1("glDrawElements: indices outside their buffer"); return; }
+        {   // the vertex range the indices touch, for the client-memory copy below
+            uint64_t lo = UINT64_MAX, hi = 0;
+            for (GLsizei i = 0; i < count; i++) {
+                uint64_t x = isz == 4 ? ((const uint32_t *)src)[i] : isz == 2 ? ((const uint16_t *)src)[i] : src[i];
+                if (x < lo) lo = x; if (x > hi) hi = x;
+            }
+            if (lo == UINT64_MAX) { lo = 0; hi = 0; }
+            g_dl_first = (int64_t)lo + base; g_dl_vend = (int64_t)hi + base + 1;
+        }
         if (!draw_setup()) return;
         if (!conv && isz > 1 && eb && io % 4 == 0) {   // the game's own index buffer
             eb->use = g_serial;
@@ -1062,6 +1135,9 @@ GL(glClearColor, void, GLfloat r, GLfloat g, GLfloat b, GLfloat a) { S.clear_c[0
 GL(glClearDepth, void, GLdouble d) { S.clear_d = d < 0 ? 0 : d > 1 ? 1 : d; }
 GL(glClearDepthf, void, GLfloat d) { S.clear_d = d < 0 ? 0 : d > 1 ? 1 : d; }
 GL(glClearStencil, void, GLint s) { S.clear_s = s; }
+// The depth range is [0,1] unless a game narrows it; the layer's viewport always maps the whole range (GameMaker's runner sets 0..1)
+GL(glDepthRange, void, GLdouble n, GLdouble f) { if (n != 0 || f != 1) RED1("glDepthRange(%g, %g): only 0..1 is mapped", (double)n, (double)f); }
+GL(glDepthRangef, void, GLfloat n, GLfloat f) { if (n != 0 || f != 1) RED1("glDepthRangef(%g, %g): only 0..1 is mapped", (double)n, (double)f); }
 // One buffer cleared to a value of its own, the clear values left as they were (LÖVE clears a canvas so when it is given a colour per canvas); colour attachment 0 only
 GLB(glClearBufferfv, void, GLenum buffer, GLint drawbuffer, const GLfloat *v) {
     if (buffer == GL_COLOR && drawbuffer == 0) { float keep[4]; memcpy(keep, S.clear_c, sizeof keep); memcpy(S.clear_c, v, sizeof keep); h_glClear(GL_COLOR_BUFFER_BIT); memcpy(S.clear_c, keep, sizeof keep); }
@@ -1081,6 +1157,7 @@ static void cap_set(GLenum cap, int on) {
     if (cap == GL_COLOR_TABLE) { S.color_table = on; return; }
     if (cap == GL_FRAMEBUFFER_SRGB) { if (on && !S.srgb) RED1("GL_FRAMEBUFFER_SRGB: writes into sRGB attachments are not converted"); S.srgb = on; return; }
     if (cap == GL_TEXTURE_2D || cap == 0x809d /* MULTISAMPLE */ || cap == 0x8642 /* PROGRAM_POINT_SIZE */ || cap == 0x8d69 /* PRIMITIVE_RESTART_FIXED_INDEX */ || cap == 0x884f /* TEXTURE_CUBE_MAP_SEAMLESS */
+        || cap == 0x864f /* DEPTH_CLAMP: Metal clamps to the depth range already */
         || cap == 0x92e0 /* DEBUG_OUTPUT */ || cap == 0x8242 /* DEBUG_OUTPUT_SYNCHRONOUS */) return;
     static GLenum seen[32]; static int n;
     for (int i = 0; i < n; i++) if (seen[i] == cap) return;
@@ -1189,6 +1266,7 @@ GL(glGetIntegerv, void, GLenum p, GLint *v) {
         case GL_TEXTURE_BINDING_3D: *v = S.units[S.unit].t3d; return;
         case GL_TEXTURE_BINDING_2D_ARRAY: *v = S.units[S.unit].t2da; return;
         case 0x84e0: *v = GL_TEXTURE0 + S.unit; return;   // ACTIVE_TEXTURE
+        case GL_MAX_TEXTURE_MAX_ANISOTROPY: *v = 16; return;
         case GL_UNPACK_ALIGNMENT: *v = S.unpack_align; return;
         case GL_PACK_ALIGNMENT: *v = S.pack_align; return;
     }
@@ -1465,6 +1543,7 @@ GLB(glDeleteFramebuffers, void, GLsizei n, const GLuint *f) {
 GLB(glBindFramebuffer, void, GLenum target, GLuint f) {
     if (target != GL_DRAW_FRAMEBUFFER) S.read_fb = f;   // GL_FRAMEBUFFER binds both
     if (target == GL_READ_FRAMEBUFFER || f == S.fb) return;
+    { static int on = -1; if (on < 0) on = getenv("DM_GL_FBLOG") != NULL; if (on) { uint32_t bw, bh; fb_size(f, &bw, &bh); GLOG("bind framebuffer %u %ux%u (was %u) after %llu draws", f, bw, bh, S.fb, (unsigned long long)g_n_draw); } }
     if (g_pend_clear.bits && g_pend_clear.fb == S.fb) clears_flush();
     S.fb = f;   // the pass ends at the next draw or clear into another framebuffer (pass_ensure)
 }
@@ -1826,15 +1905,65 @@ GL(glGetUniformuiv, void, GLuint pr, GLint loc, GLuint *v) { uni_read(pr, loc, v
 #define EGL_TRUE 1
 static struct { int init; int surface; uint32_t w, h; } g_egl;
 static uint64_t g_frames;
+// One PNG of a framebuffer's colour attachment, for a picture of what a target holds when the window stays black
+static void png_of_tex(id<MTLTexture> t, const char *path) {
+    if (!t) { GLOG("[RED] fbdump: no colour attachment"); return; }
+    if (t.pixelFormat != MTLPixelFormatRGBA8Unorm && t.pixelFormat != MTLPixelFormatBGRA8Unorm) { GLOG("[RED] fbdump: format %lu not supported", (unsigned long)t.pixelFormat); return; }
+    size_t w = t.width, h = t.height, row = w * 4;
+    id<MTLBuffer> buf = [g_dev newBufferWithLength:row * h options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
+    [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    int bgra = t.pixelFormat == MTLPixelFormatBGRA8Unorm;
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(buf.contents, w, h, 8, row, cs, bgra ? (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little) : (CGBitmapInfo)kCGImageAlphaNoneSkipLast);
+    CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+    CGImageDestinationRef dst = url ? CGImageDestinationCreateWithURL(url, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL) : NULL;
+    int ok = 0;
+    if (!ctx || !img || !dst) GLOG("[RED] fbdump %s failed", path);
+    else { CGImageDestinationAddImage(dst, img, NULL); ok = CGImageDestinationFinalize(dst); }
+    if (dst) CFRelease(dst); if (url) CFRelease(url); CGImageRelease(img); CGContextRelease(ctx); CGColorSpaceRelease(cs);
+    GLOG("fbdump %zux%zu format %lu → %s %s", w, h, (unsigned long)t.pixelFormat, path, ok ? "ok" : "failed");
+}
+// DM_GL_FBDUMP=<fb>:<seconds>:<path>[|<seconds>:<path>…]: dumps of that framebuffer's colour attachment, each at the first frame end after its <seconds>
+static void fbdump_tick(void) {
+    static int on = -1, done, next; static unsigned fb; static double at[16]; static char path[16][1024]; static double t0;
+    if (on < 0) {
+        on = 0; const char *e = getenv("DM_GL_FBDUMP"); if (!e) return;
+        t0 = now_ns() / 1e9;
+        char tmp[2048]; strlcpy(tmp, e, sizeof tmp);
+        char *tok[17]; int nt = 0;   // <fb>:<seconds>:<path>|<seconds>:<path>|…
+        for (char *q = tmp; q && *q && nt < 17; ) { tok[nt++] = q; char *b = strchr(q, '|'); if (!b) break; *b = 0; q = b + 1; }
+        char *c1 = nt ? strchr(tok[0], ':') : NULL;
+        if (!nt || !c1) { GLOG("[RED] DM_GL_FBDUMP wants <fb>:<seconds>:<path>[|<seconds>:<path>…], got %s", e); return; }
+        *c1 = 0; fb = (unsigned)atoi(tok[0]);
+        for (int i = 0; i < nt && next < 16; i++) {   // the first entry keeps its <fb>: prefix, the rest are <seconds>:<path>
+            char *t = i ? tok[i] : c1 + 1, *c = strchr(t, ':');
+            if (!c) { GLOG("[RED] DM_GL_FBDUMP entry %s wants <seconds>:<path>", t); continue; }
+            *c = 0; at[next] = atof(t); strlcpy(path[next], c + 1, sizeof path[next]); next++;
+        }
+        on = 1;
+    }
+    if (!on || done >= next || now_ns() / 1e9 - t0 < at[done]) return;
+    int lv = 0, sl = 0; id<MTLTexture> t = fb_color(fb, &lv, &sl);
+    pass_end();   // the frame's encoder must be closed before a readback of its target
+    png_of_tex(t, path[done]); done++;
+}
 // Every 300 frames: draws, passes, uploads; every 1800: memory (the process footprint, Metal's allocations, the GL objects alive), as the NVN layer's memory report
 static void frame_end(void) {
     static uint64_t pd, pp, pu, pb, pc;
     uint64_t f = ++g_frames, dr = g_n_draw, pa = g_n_pass, up = g_n_up, bl = g_n_blit, cb = g_n_cb;
+    uint64_t sp = g_sk_prog, sq = g_sk_pass, sa = g_sk_attr, so = g_sk_pso;
+    static uint64_t pd2, pq, pa2, po;
     if (f <= 3 || f % 300 == 0) {
         GLOG("frame %llu: draws %llu, passes %llu, uploads %llu (%llu by blit), command buffers %llu (since the last record, %llu frames); pipelines so far %llu",
              (unsigned long long)f, (unsigned long long)(dr - pd), (unsigned long long)(pa - pp), (unsigned long long)(up - pu), (unsigned long long)(bl - pb),
              (unsigned long long)(cb - pc), (unsigned long long)(f <= 3 ? 1 : 300), (unsigned long long)g_n_pso);
         pd = dr; pp = pa; pu = up; pb = bl; pc = cb;
+        if (sp || sq || sa || so) { GLOG("frame %llu: dropped draws since the last record: %llu no program, %llu no pass, %llu no attribute buffer, %llu no pipeline",
+             (unsigned long long)f, (unsigned long long)(sp - pd2), (unsigned long long)(sq - pq), (unsigned long long)(sa - pa2), (unsigned long long)(so - po));
+            pd2 = sp; pq = sq; pa2 = sa; po = so; }
     }
     if (f % 1800 == 0) {
         task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
@@ -1845,6 +1974,7 @@ static void frame_end(void) {
         GLOG("memory at frame %llu: footprint %.0f MB, Metal allocated %.0f MB; %u textures, %u buffers (%.0f MB), %d transient blocks",
              (unsigned long long)f, foot / 1048576.0, g_dev.currentAllocatedSize / 1048576.0, nt, nb, bb / 1048576.0, g_narena);
     }
+    fbdump_tick();
     dm_guest_frame_tick();
 }
 EGL(eglGetDisplay, EGLDisplay, void *native) { (void)native; dev_init(); return (EGLDisplay)&g_egl; }
@@ -1964,6 +2094,59 @@ static void *gl_stub(const char *name) {
     g_stub_name[g_nstub] = name;   // the game's own string (its loader's name table)
     return (void *)(gl_stubs + 8 * g_nstub++);
 }
+// DM_GL_TRACE=<seconds>:<seconds>:<name filter>: logs every GL call in that window whose name contains one of the filter's comma-separated words (empty filter: all of them).
+// The guest gets a tracing stub per name instead of the function itself, so the log is the game's own call order, which is what a black frame or a missing pass is read from
+#define NTRACE 4096
+static const char *g_trace_name[NTRACE]; static int g_ntrace;
+void *g_trace_fn[NTRACE];
+static double g_tr_t0, g_tr_a, g_tr_b; static int g_tr_on = -1; static char g_tr_filter[512];
+static int tr_match(const char *n) {   // the filter holds comma-separated substrings of a name (its words survive strsep-able copies: no allocation on the GL thread)
+    const char *f = g_tr_filter; size_t ln = strlen(n);
+    while (*f) {
+        const char *c = strchr(f, ','); size_t l = c ? (size_t)(c - f) : strlen(f);
+        if (l && ln >= l && memmem(n, ln, f, l)) return 1;
+        f = c ? c + 1 : f + l;
+    }
+    return 0;
+}
+void gl_trace_c(uint64_t k, uint64_t *r) __attribute__((used));
+void gl_trace_c(uint64_t k, uint64_t *r) {
+    if (k >= (uint64_t)g_ntrace) return;
+    const char *n = g_trace_name[k];
+    if (g_tr_filter[0] && !tr_match(n)) return;
+    double t = now_ns() / 1e9 - g_tr_t0;
+    if (t < g_tr_a || t > g_tr_b) return;
+    GLOG("[trace %.2f th=%p ndraw=%llu] %s(%#llx, %#llx, %#llx, %#llx)", t, (void *)pthread_self(), (unsigned long long)__c11_atomic_load(&g_n_draw, __ATOMIC_RELAXED), n, (unsigned long long)r[0], (unsigned long long)r[1], (unsigned long long)r[2], (unsigned long long)r[3]);
+    if (getenv("DM_GL_TRACE_LR")) GLOG("    caller %#llx", (unsigned long long)r[24]);
+}
+__asm__(".text\n.p2align 2\n_gl_trace_entry:\n"
+        "    sub sp, sp, #256\n"
+        "    stp x0, x1, [sp, #0]\n    stp x2, x3, [sp, #16]\n    stp x4, x5, [sp, #32]\n    stp x6, x7, [sp, #48]\n"
+        "    stp q0, q1, [sp, #64]\n    stp q2, q3, [sp, #96]\n    stp q4, q5, [sp, #128]\n    stp q6, q7, [sp, #160]\n"
+        "    stp x30, x9, [sp, #192]\n"
+        "    mov x0, x9\n    mov x1, sp\n    bl _gl_trace_c\n"
+        "    ldp x30, x9, [sp, #192]\n"
+        "    adrp x16, _g_trace_fn@PAGE\n    add x16, x16, _g_trace_fn@PAGEOFF\n    ldr x16, [x16, x9, lsl #3]\n"
+        "    ldp q6, q7, [sp, #160]\n    ldp q4, q5, [sp, #128]\n    ldp q2, q3, [sp, #96]\n    ldp q0, q1, [sp, #64]\n"
+        "    ldp x6, x7, [sp, #48]\n    ldp x4, x5, [sp, #32]\n    ldp x2, x3, [sp, #16]\n    ldp x0, x1, [sp, #0]\n"
+        "    add sp, sp, #256\n    br x16\n"
+        ".p2align 3\n.globl _gl_traces\n.private_extern _gl_traces\n_gl_traces:\n.set gl_tr_k, 0\n.rept 4096\n"
+        "    mov x9, #gl_tr_k\n    b _gl_trace_entry\n.set gl_tr_k, gl_tr_k + 1\n.endr\n");
+extern const char gl_traces[];   // 8 bytes a stub
+static void *gl_trace(const char *name, void *impl) {
+    if (g_tr_on < 0) {
+        g_tr_on = 0; const char *e = getenv("DM_GL_TRACE"); if (!e) return impl;
+        char tmp[768]; strlcpy(tmp, e, sizeof tmp); char *c1 = strchr(tmp, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+        if (!c1) { GLOG("[RED] DM_GL_TRACE wants <seconds>:<seconds>:<names>, got %s", e); return impl; }
+        *c1 = 0; g_tr_a = atof(tmp); g_tr_b = c2 ? atof(c1 + 1) : g_tr_a + 0.5; strlcpy(g_tr_filter, c2 ? c2 + 1 : "", sizeof g_tr_filter);
+        g_tr_t0 = now_ns() / 1e9; g_tr_on = 1;
+        GLOG("GL trace from %.2f to %.2f s, names matching '%s'", g_tr_a, g_tr_b, g_tr_filter);
+    }
+    if (!g_tr_on || g_ntrace == NTRACE) return impl;
+    g_trace_name[g_ntrace] = name;
+    g_trace_fn[g_ntrace] = impl;
+    return (void *)(gl_traces + 8 * g_ntrace++);
+}
 EGL(eglGetProcAddress, void *, const char *name) {
     static int asked, found; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     void *fn = name && !strncmp(name, "gl", 2) ? gl_lookup(name) : NULL;
@@ -1971,6 +2154,7 @@ EGL(eglGetProcAddress, void *, const char *name) {
     asked++; if (fn) found++;
     if (asked % 500 == 0 || (fn && g_log)) GLOG("eglGetProcAddress: %d names asked, %d implemented (last %s)", asked, found, name);
     if (!fn && name && !strncmp(name, "gl", 2)) fn = gl_stub(name);
+    else if (fn && name && !strncmp(name, "gl", 2)) fn = gl_trace(name, fn);
     pthread_mutex_unlock(&mu);
     return fn;
 }
