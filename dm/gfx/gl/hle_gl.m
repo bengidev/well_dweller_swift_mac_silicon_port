@@ -1203,6 +1203,10 @@ GL(glColorTable, void, GLenum target, GLenum ifmt, GLsizei w, GLenum format, GLe
 GL(glTexEnvi, void, GLenum t, GLenum p, GLint v) { (void)t; (void)p; (void)v; }
 GL(glGetError, GLenum, void) { return 0; }
 // Everything recorded so far runs to its end (LÖVE when the window changes)
+// glFlush: hand the commands encoded so far to the GPU without waiting. The layer commits at the frame's end, so a game that flushes in the middle of a frame
+// (GameMaker's runner does, before a menu or a surface read) would otherwise see nothing but the pointer: eglGetProcAddress returned null for a name it only
+// asks for, the guest called it and jumped to address 0 (Well Dweller's `CRASH sig=11 addr=0 pc=0 lr=main+0x3409a78`, at the pause menu).
+GLB(glFlush, void, void) { if (g_pend_clear.bits) clears_flush(); dm_gfx_enter(); cb_commit(); dm_gfx_leave(); }
 GLB(glFinish, void, void) { if (g_pend_clear.bits) clears_flush(); dm_gfx_enter(); id<MTLCommandBuffer> cb = cb_get(); cb_commit(); [cb waitUntilCompleted]; dm_gfx_leave(); }
 // Debug output and labels (LÖVE's debug groups and its GL debug callback, used when the game asks for debug output): none here
 GL(glDebugMessageCallback, void, void *cb, const void *user) { (void)cb; (void)user; }
@@ -2147,12 +2151,23 @@ static void *gl_trace(const char *name, void *impl) {
     g_trace_fn[g_ntrace] = impl;
     return (void *)(gl_traces + 8 * g_ntrace++);
 }
+// A name the loader asks for and the layer does not implement gets a null pointer, which is the documented meaning of "not there" (many loaders ask for the
+// whole GL 4.6 list and only call a few). The cost is that calling one jumps to address 0 with nothing in the log to say which: `[RED] CRASH sig=11 addr=0
+// pc=0 lr=<the blr's return address>` is that mistake. DM_GL_MISSES=1 prints every missing name once, and DM_GL_STUBS=1 replaces them with stubs that report
+// their first call, which names the one the game actually calls (GameMaker's runner asks for 215 names it does not implement and calls glFlush).
+static const char *g_miss_name[512]; static int g_nmiss;
+static void note_miss(const char *name) {
+    for (int i = 0; i < g_nmiss; i++) if (g_miss_name[i] == name) return;
+    if (g_nmiss < 512) g_miss_name[g_nmiss++] = name;
+    if (getenv("DM_GL_MISSES")) GLOG("[RED] eglGetProcAddress(%s): not implemented, the game gets a null pointer", name);
+}
 EGL(eglGetProcAddress, void *, const char *name) {
     static int asked, found; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     void *fn = name && !strncmp(name, "gl", 2) ? gl_lookup(name) : NULL;
     pthread_mutex_lock(&mu);
     asked++; if (fn) found++;
-    if (asked % 500 == 0 || (fn && g_log)) GLOG("eglGetProcAddress: %d names asked, %d implemented (last %s)", asked, found, name);
+    if (!fn && name && !strncmp(name, "gl", 2)) note_miss(name);
+    if (asked % 500 == 0 || (fn && g_log)) GLOG("eglGetProcAddress: %d names asked, %d implemented, %d not implemented (last %s)", asked, found, g_nmiss, name);
     if (!fn && name && !strncmp(name, "gl", 2)) fn = gl_stub(name);
     else if (fn && name && !strncmp(name, "gl", 2)) fn = gl_trace(name, fn);
     pthread_mutex_unlock(&mu);
