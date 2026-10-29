@@ -7,3 +7,15 @@ __pycache__/
 # Made from each shader build's Mac outputs (c1_guard.py, cb_extent.py; the NSP script makes them), not committed
 dm/games/*/c1_full.tsv
 dm/games/*/cb_extent.tsv
+
+# Never commit game files or keys: they are the user's own, and a committed copy makes this repository a
+# distribution of circumvention material rather than a host for games you own (see README, "Copyright").
+*.nsp
+*.xci
+*.nsz
+*.xcz
+*.ipa
+*.keys
+prod.keys
+title.keys
+*_build/
