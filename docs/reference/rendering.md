@@ -782,6 +782,14 @@ Digimon Story Cyber Sleuth: Complete Edition (Media.Vision's MVGL engine, SDK 6.
 - **Fix:** the host's GL layer (`dm/gfx/gl/hle_gl.m`) answers the EGL imports and `eglGetProcAddress` (the rest of this section).
 - **Found on:** [Digimon Story Cyber Sleuth: Complete Edition](../../dm/games/010014E00DB56000/README.md) (SDK 6.4.0, Media.Vision's MVGL engine; one boot).
 
+### `glFlush` hands the frame so far to the GPU
+
+- **Symptom:** the app closes with no message of its own, `[dm] CRASH sig=11 addr=0 pc=0` and a guest return address inside `main` (Well Dweller: `lr=main+0x3409a78`, the same address every time); `DM_GL_STUBS=1` then names the call: `[RED] glFlush called: not implemented, returns 0`.
+- **Cause:** `glFlush` is not one of the layer's names, so `eglGetProcAddress` returns a null pointer, which the game stores in its own function table and calls when it opens a menu. `blr` into address 0 is a signal, not an abort, so nothing else says which function was wanted. A game's loader asks for the whole GL 4.6 name list (Well Dweller: 215 names, mostly 3.3+ features it never calls), so a null pointer by itself is correct; calling one is not.
+- **Fix:** `glFlush` flushes pending clears and commits the open command buffer without waiting (`GLB(glFlush, …)` next to `glFinish` in `dm/gfx/gl/hle_gl.m`), and the calls after it start a new command buffer. `DM_GL_STUBS=1` remains the way to name a missing one, and `DM_GL_MISSES=1` prints every name the loader asked for and the layer does not implement.
+- **Check:** Well Dweller, the same scripted input that crashed at the pause menu: the OPTIONS, GRAPHICS, STATS and PAGES screens open and the game returns to play (`[gl] frame 15300`, 35 draws per frame).
+- **Found on:** [Well Dweller](../../dm/games/0100217023F6C000/README.md).
+
 ### Direct GL imports use the same implementations as the loader
 
 - **Symptom:** `UNIMPL glCreateShader` returns 0, followed by `UNIMPL glShaderSource`, `glCompileShader`, `glGetShaderiv` and `glGetShaderInfoLog`; the game crashes in `sdk` with a null shader handle even though EGL initialized.
