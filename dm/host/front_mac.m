@@ -1,7 +1,8 @@
 // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and controllers → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // The window is fullscreen-capable (the green button and ⌃⌘F); DM_FULLSCREEN starts it that way. ⌘Q quits; the left mouse button is the touchscreen.
-// Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
+// Key map (Nintendo layout, the arrangement the desktop emulators use): Z=A X=B C=X V=Y; the arrow keys the left stick; I J K L the D-pad, and the right stick as well, since
+// that arrangement gives it the same four keys; left Shift presses the left stick, right Shift the right one; Q=L E=R 1=ZL 3=ZR; = is + and - is −; Space shakes the controller.
 // Controllers: buttons by position as on the iPhone (right A, bottom B, top X, left Y), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
 // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
 // DM_PAD_MERGE=1 merges every controller into player 1 instead, DM_KBD_PLAYER=own makes the keyboard player 1 on its own, with the controllers from player 2 on.
@@ -20,7 +21,8 @@
 
 static CAMetalLayer *g_layer;
 static uint64_t g_btn;
-static int g_w, g_a, g_s, g_d;
+static int g_lu, g_ld, g_ll, g_lr;   // the left stick: arrow keys
+static int g_ru, g_rd, g_rl, g_rr;   // the right stick: I J K L, the same keys the D-pad has
 static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
@@ -83,23 +85,27 @@ void front_screen_match(int fps) {
     g_match_want = fps; dispatch_async(dispatch_get_main_queue(), ^{ screen_match_apply(); });
 }
 static void push(void) {
-    int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
-    dm_input_set(g_btn, lx, ly, 0, 0);
+    int32_t lx = (g_lr - g_ll) * 32767, ly = (g_lu - g_ld) * 32767;
+    int32_t rx = (g_rr - g_rl) * 32767, ry = (g_ru - g_rd) * 32767;
+    dm_input_set(g_btn, lx, ly, rx, ry);
 }
 static int key_bit(unsigned short code) {
     switch (code) {
-        case 38: return 0;  case 40: return 1;  case 32: return 2;  case 34: return 3;    // J K U I → A B X Y
-        case 3: return 4;   case 5: return 5;                                            // F G → press stick
-        case 12: return 6;  case 14: return 7;  case 6: return 8;   case 8: return 9;    // Q E Z C → L R ZL ZR
-        case 36: return 10; case 48: return 11;                                          // Return Tab → + −
-        case 123: return 12; case 126: return 13; case 124: return 14; case 125: return 15; // ← ↑ → ↓
+        case 6: return 0;   case 7: return 1;   case 8: return 2;   case 9: return 3;    // Z X C V → A B X Y
+        case 56: return 4;  case 60: return 5;                                           // left Shift, right Shift → press the left, the right stick
+        case 12: return 6;  case 14: return 7;  case 18: return 8;  case 20: return 9;    // Q E 1 3 → L R ZL ZR
+        case 24: return 10; case 27: return 11;                                          // = - → + −
+        case 38: return 12; case 34: return 13; case 37: return 14; case 40: return 15;   // J I L K → ← ↑ → ↓
     }
     return -1;
 }
 static void on_key(NSEvent *e, int down) {
     if (!g_input_on) return;
     unsigned short c = e.keyCode;
-    switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
+    switch (c) {
+        case 126: g_lu = down; break; case 125: g_ld = down; break; case 123: g_ll = down; break; case 124: g_lr = down; break;   // arrows: the left stick
+        case 34: g_ru = down; break;  case 40: g_rd = down; break;  case 38: g_rl = down; break;  case 37: g_rr = down; break;   // I K J L: the right stick
+    }
     int b = key_bit(c);
     uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
     g_btn = down ? (g_btn | m) : (g_btn & ~m);
@@ -165,7 +171,7 @@ static void pads_changed(GCController *gone) {
 static int g_mouse_down;   // the mouse holds the touch (DmGameView)
 static void input_release(void) {
     g_input_on = 0;
-    g_btn = 0; g_w = g_a = g_s = g_d = 0; push();
+    g_btn = 0; g_lu = g_ld = g_ll = g_lr = g_ru = g_rd = g_rl = g_rr = 0; push();
     if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
     if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad) { dm_pad_set(0, 0, 0, 0, 0); break; } }
     else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p]) dm_pad_set_player(p, 0, 0, 0, 0, 0);
@@ -332,7 +338,7 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     dispatch_sync(dispatch_get_main_queue(), ^{
         // The box takes the keyboard and the mouse, so the game window never sees the key-up of the button or the touch-up of the click that opened it: nothing may stay pressed
         // while it is up, or the game reads the stuck button / touch the moment the box closes (Stardew Valley's character creation re-opened the keyboard endlessly)
-        g_btn = 0; g_w = g_a = g_s = g_d = 0; push();
+        g_btn = 0; g_lu = g_ld = g_ll = g_lr = g_ru = g_rd = g_rl = g_rr = 0; push();
         dm_touch_set(NULL, 0);
         int min_chars = g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0;
         NSString *info = [NSString stringWithFormat:@"%s%s%s", sub ? sub : "", sub && *sub && guide && *guide ? "\n" : "", guide ? guide : ""];

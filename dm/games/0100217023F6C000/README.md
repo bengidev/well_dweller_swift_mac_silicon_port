@@ -4,7 +4,7 @@ Version 1.0.0, SDK **22.2.0** (`nnSdk-22_2_0`, `NintendoSDK_NVN-22_2_0`, `Ninten
 
 It renders with **OpenGL**, not NVN: `main` imports exactly nine EGL entry points (`eglChooseConfig`, `eglCreateContext`, `eglCreateWindowSurface`, `eglDestroySurface`, `eglGetDisplay`, `eglGetProcAddress`, `eglInitialize`, `eglMakeCurrent`, `eglSwapBuffers`) and every GL function through `eglGetProcAddress`. The context is `OpenGL 3.2`. Modules `main`, `subsdk1` (`NintendoSDK_movie`) and `sdk`; `subsdk0` (NVIDIA's GL driver) is never loaded.
 
-On the Mac: the language list, the title screen, the opening story and the first room with its dialog render at 60 fps with sound, played with the keyboard (WASD + J/K) or a pad.
+On the Mac: the language list, the title screen, the opening story and the first room with its dialog render at 60 fps with sound, played with the keyboard (Z is A, X is B, the arrows are the left stick) or a pad.
 
 ## What it needs
 
